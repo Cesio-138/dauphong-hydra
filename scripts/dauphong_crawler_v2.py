@@ -519,6 +519,44 @@ def write_meta(meta_path, meta):
     _atomic_write(meta_path, meta)
 
 
+def write_history(history_path, entry):
+    """Append *entry* to the history log (list-of-objects JSON)."""
+    if os.path.exists(history_path):
+        try:
+            with open(history_path, "r", encoding="utf-8") as f:
+                history = json.load(f)
+            if not isinstance(history, list):
+                history = []
+        except Exception:
+            history = []
+    else:
+        history = []
+    history.append(entry)
+    _atomic_write(history_path, history)
+
+
+def load_titles_snapshot(snapshot_path):
+    """Load the title set saved at the end of the last completed run.
+
+    Returns a ``set`` of title strings, or ``None`` if no snapshot exists.
+    """
+    if not os.path.exists(snapshot_path):
+        return None
+    try:
+        with open(snapshot_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return set(data)
+    except Exception:
+        pass
+    return None
+
+
+def write_titles_snapshot(snapshot_path, titles):
+    """Persist the published title set for diffing in the next completed run."""
+    _atomic_write(snapshot_path, sorted(titles))
+
+
 # ---------------------------------------------------------------------------
 # Phase 5 — Dedup (keep top N per game)
 # ---------------------------------------------------------------------------
@@ -597,6 +635,21 @@ def crawl(
     # ── load existing data ────────────────────────────────────────────────
     accumulated = load_existing(output_path)
     print(f"[crawl] {len(accumulated)} existing entries loaded from {output_path!r}.")
+
+    # Derive companion file paths
+    _base = os.path.splitext(output_path)[0]
+    history_path = _base + "_history.json"
+    snapshot_path = _base + "_titles_snapshot.json"
+
+    # initial_titles comes from the last *completed* run's snapshot so that
+    # interrupted runs (which write non-deduped incremental data to the JSON)
+    # don't pollute the diff.  Fallback to accumulated on the very first run.
+    initial_titles = load_titles_snapshot(snapshot_path)
+    if initial_titles is None:
+        initial_titles = {e["title"] for e in accumulated.values()}
+        print(f"[history] No snapshot found — using accumulated titles as baseline ({len(initial_titles)}).")
+    else:
+        print(f"[history] Snapshot loaded: {len(initial_titles)} titles as baseline for this run.")
 
     # ── meta / auto-resume ────────────────────────────────────────────────
     meta = load_meta(meta_path)
@@ -791,6 +844,30 @@ def crawl(
         "last_completed_page": page_index - 1 if pages_fetched > 0 else meta.get("last_completed_page", -1),
     })
     write_meta(meta_path, meta)
+
+    # ── history log (only on full successful run) ─────────────────────────
+    if status == "completed":
+        final_titles = {d["title"] for d in downloads}
+        titles_added = sorted(final_titles - initial_titles)
+        titles_removed = sorted(initial_titles - final_titles)
+        history_entry = {
+            "timestamp": meta["last_run"],
+            "run_status": status,
+            "total_entries": len(downloads),
+            "total_pages_crawled": pages_fetched,
+            "total_pages_known": total_pages,
+            "http_backend": backend_pool[current_backend_idx].name,
+            "pruned_zero_seed": pruned_count,
+            "deduped_entries": deduped_count,
+            "entries_added": len(titles_added),
+            "entries_removed": len(titles_removed),
+            "titles_added": titles_added,
+            "titles_removed": titles_removed,
+        }
+        # Persist snapshot BEFORE writing history so next run has accurate baseline
+        write_titles_snapshot(snapshot_path, final_titles)
+        write_history(history_path, history_entry)
+        print(f"[history] Entry recorded in {history_path!r}: +{len(titles_added)} added, -{len(titles_removed)} removed.")
 
     print(f"[crawl] Done ({status}). Final entries: {len(downloads)}")
 
