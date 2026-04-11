@@ -286,5 +286,44 @@
       "Zoochosis MEET NEW ANIMALS Update v3 0 0-TENOKE"
     ],
     "titles_removed": []
+  },
+  {
+    "timestamp": "2026-04-11T00:58:23.126549+00:00",
+    "run_status": "completed",
+    "total_entries": 49569,
+    "total_pages_crawled": 2188,
+    "total_pages_known": 2188,
+    "http_backend": "requests",
+    "pruned_zero_seed": 0,
+    "deduped_entries": 14582,
+    "entries_added": 21,
+    "entries_removed": 1,
+    "titles_added": [
+      "DarkSwitch-RUNE",
+      "Dawn Break-TENOKE",
+      "Formula Legends Iconic Tracks-RUNE",
+      "GUILTY GEAR STRIVE Jam Kuradoberi-TENOKE",
+      "Hell is Us v1 6-RUNE",
+      "Hero Siege Season 9-PLAZA",
+      "Iron Commando - Koutetsu no Senshi Build 8219216",
+      "Jotunnslayer Hordes of Hel Conan-RUNE",
+      "MINOS",
+      "Mad Television Tycoon",
+      "POJANGMACHA Korean Street Food Management Simulator-TENOKE",
+      "Post Apocalypse Microbe Lab",
+      "PowerWash Simulator 2 Adventure Time Pack-TENOKE",
+      "Resident Evil Requiem-voices38",
+      "Restore Your Island",
+      "Rift of the NecroDancer UNDERTALE Music Pack-TENOKE",
+      "Shadow Empire (v1.31 & All DLCs)",
+      "Solar Expanse - Space Exploration Manager",
+      "Soulmask-RUNE",
+      "WRATH: Aeon of Ruin VR - Brutal Edition",
+      "Weed Supermarket Simulator",
+      "Blue Angels Aerobatic Flight Simulator-SKIDROW"
+    ],
+    "titles_removed": [
+      "Shadow Empire v1.26.14"
+    ]
   }
 ]
