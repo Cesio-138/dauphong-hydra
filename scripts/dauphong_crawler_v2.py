@@ -700,6 +700,7 @@ def crawl(
     page_index = start_page
     pages_fetched = 0
     consecutive_errors = 0
+    aborted_on_error = False
     seen_this_run = {}  # {infohash: seed_count} — for pruning
 
     # Graceful Ctrl+C: save state before exit
@@ -741,6 +742,7 @@ def crawl(
                 print(f"[apibay] Page {page_index + 1} failed (HTTP {result.status_code}). Consecutive errors: {consecutive_errors}/{max_consecutive_errors}")
                 if consecutive_errors >= max_consecutive_errors:
                     print(f"[apibay] Max consecutive errors reached — aborting crawl.")
+                    aborted_on_error = True
                     break
                 if consecutive_errors % 3 == 0:
                     print(f"[apibay] Pausing 5 minutes after {consecutive_errors} consecutive errors...")
@@ -834,7 +836,7 @@ def crawl(
 
     # ── final write ───────────────────────────────────────────────────────
     write_json(output_path, downloads)
-    status = "interrupted" if interrupted else "completed"
+    status = "interrupted" if interrupted else "error" if aborted_on_error else "completed"
     meta.update({
         "run_status": status,
         "last_run": datetime.now(timezone.utc).isoformat(),
