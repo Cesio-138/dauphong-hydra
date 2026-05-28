@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Dauphong Hydra Source Crawler — V2
+"""Dauphong Hydra Source Crawler — V3
 
 Crawls torrents from user ``dauphong`` on The Pirate Bay (via apibay.org)
 and produces a Hydra-Launcher-compatible JSON source file.
 
-Uses a proxy_list file with HTTP proxies. If a proxy fails, rotates to the
-next one automatically.
+Fetches multiple pages in parallel — one per proxy — for maximum throughput.
+Failed pages are retried on other proxies automatically.
 """
 
 import re
@@ -13,12 +13,15 @@ import os
 import sys
 import json
 import time
-import argparse
+import queue
 import base64
 import html
+import argparse
+import threading
 import unicodedata
 from datetime import datetime, timezone
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import quote_plus
 
 import requests
@@ -43,7 +46,7 @@ TRACKERS = [
 
 
 # ---------------------------------------------------------------------------
-# Utilities
+# Utilities (same as V2)
 # ---------------------------------------------------------------------------
 
 def bytes_to_human(size_bytes):
@@ -123,11 +126,10 @@ def normalize_game_name(title):
 
 
 # ---------------------------------------------------------------------------
-# Proxy management
+# Proxy loading
 # ---------------------------------------------------------------------------
 
 def load_proxies(proxy_file):
-    """Load HTTP proxy URLs from a text file (one per line)."""
     if not os.path.exists(proxy_file):
         sys.exit(f"[error] Proxy list not found: {proxy_file}")
     proxies = []
@@ -142,35 +144,26 @@ def load_proxies(proxy_file):
 
 
 # ---------------------------------------------------------------------------
-# HTTP fetch with proxy rotation
+# Synchronous fetch (used by workers)
 # ---------------------------------------------------------------------------
 
-def fetch_json(url, proxies, current_idx, *, timeout=30):
-    """Fetch JSON from *url* through a proxy, rotating on failure.
-
-    Returns ``(data, new_idx)``.  *data* is the parsed JSON or ``None``.
-    If all proxies fail, ``(None, current_idx)`` is returned.
-    """
-    n = len(proxies)
-    for offset in range(n):
-        idx = (current_idx + offset) % n
-        proxy_url = proxies[idx]
-        proxy_dict = {"http": proxy_url, "https": proxy_url}
-        try:
-            r = requests.get(url, proxies=proxy_dict, timeout=timeout)
-            if r.status_code == 200:
-                return r.json(), idx
-            print(f"  [proxy {idx}] HTTP {r.status_code}")
-        except requests.RequestException as exc:
-            print(f"  [proxy {idx}] {exc}")
-        time.sleep(0.5)
-
-    print(f"  [proxy] All {n} proxies exhausted for {url}")
-    return None, current_idx
+def fetch_page(url, proxy_url, timeout):
+    """Fetch a single page through a proxy. Returns parsed JSON or None."""
+    try:
+        r = requests.get(
+            url,
+            proxies={"http": proxy_url, "https": proxy_url},
+            timeout=timeout,
+        )
+        if r.status_code == 200:
+            return r.json()
+    except requests.RequestException:
+        pass
+    return None
 
 
 # ---------------------------------------------------------------------------
-# Apibay parser
+# Apibay parser (same as V2)
 # ---------------------------------------------------------------------------
 
 def parse_apibay_page(data):
@@ -252,18 +245,16 @@ def write_json(path, downloads):
 
 
 # ---------------------------------------------------------------------------
-# Dedup
+# Dedup & pruning
 # ---------------------------------------------------------------------------
 
 def dedup_downloads(downloads, max_versions):
     if max_versions <= 0:
         return downloads, 0
-
     groups = defaultdict(list)
     for d in downloads:
         key = normalize_game_name(d["title"])
         groups[key].append(d)
-
     kept = []
     removed = 0
     for key in groups:
@@ -271,14 +262,9 @@ def dedup_downloads(downloads, max_versions):
         entries.sort(key=lambda x: x.get("uploadDate") or "", reverse=True)
         kept.extend(entries[:max_versions])
         removed += max(0, len(entries) - max_versions)
-
     kept = sort_downloads(kept)
     return kept, removed
 
-
-# ---------------------------------------------------------------------------
-# Seed pruning
-# ---------------------------------------------------------------------------
 
 def prune_zero_seed(accumulated, seen_this_run):
     to_remove = [ih for ih, seeds in seen_this_run.items() if seeds <= 0 and ih in accumulated]
@@ -288,27 +274,26 @@ def prune_zero_seed(accumulated, seen_this_run):
 
 
 # ---------------------------------------------------------------------------
-# Main crawl
+# Parallel crawl
 # ---------------------------------------------------------------------------
 
-def crawl(output_path, proxy_file, *, max_pages=None, sleep_between=1.0,
-          max_versions=3, max_consecutive_errors=10, timeout=30,
-          no_prune=False):
+def crawl(output_path, proxy_file, *, max_pages=None, max_versions=3,
+          timeout=30, no_prune=False, save_interval=10):
     # ── proxies ─────────────────────────────────────────────────────────
     proxies = load_proxies(proxy_file)
-    print(f"[crawl] Loaded {len(proxies)} proxies from {proxy_file!r}")
-    proxy_idx = 0
+    n_proxies = len(proxies)
+    print(f"[crawl] Loaded {n_proxies} proxies from {proxy_file!r}")
 
     # ── load existing data ──────────────────────────────────────────────
     accumulated = load_existing(output_path)
     print(f"[crawl] {len(accumulated)} existing entries loaded from {output_path!r}")
 
-    # ── get total page count ────────────────────────────────────────────
-    total_pages = None
-    data, proxy_idx = fetch_json(
+    # ── get total page count (single request, first proxy) ──────────────
+    data = fetch_page(
         f"https://apibay.org/q.php?q=pcnt:{APIBAY_USER}",
-        proxies, proxy_idx, timeout=timeout,
+        proxies[0], timeout,
     )
+    total_pages = None
     if data is not None:
         if isinstance(data, str):
             total_pages = int(data)
@@ -319,97 +304,164 @@ def crawl(output_path, proxy_file, *, max_pages=None, sleep_between=1.0,
     if total_pages:
         print(f"[apibay] Total pages: {total_pages}")
     else:
-        print("[apibay] Could not determine total pages — will crawl until empty page")
+        sys.exit("[apibay] Could not determine total pages — aborting.")
 
-    # ── pagination loop ─────────────────────────────────────────────────
-    page_index = 0
-    pages_fetched = 0
-    consecutive_errors = 0
+    # Apply max_pages limit
+    if max_pages is not None:
+        total_pages = min(total_pages, max_pages)
+        print(f"[crawl] Limited to {total_pages} pages by --max-pages.")
+
+    if total_pages <= 0:
+        print("[crawl] No pages to fetch.")
+        return
+
+    # ── page queue ──────────────────────────────────────────────────────
+    page_queue = queue.Queue()
+    for page_idx in range(total_pages):
+        page_queue.put(page_idx)
+
+    # ── shared state ────────────────────────────────────────────────────
+    lock = threading.Lock()
     seen_this_run = {}
+    pages_done = 0
+    pages_failed = 0
+    new_total = 0
+    upd_total = 0
+    should_stop = threading.Event()
 
-    while True:
-        if max_pages is not None and pages_fetched >= max_pages:
-            print(f"[apibay] --max-pages={max_pages} limit reached.")
-            break
-        if total_pages is not None and page_index >= total_pages:
-            print(f"[apibay] All {total_pages} pages processed.")
-            break
+    # Track which proxy is assigned to which thread (for logging)
+    thread_proxy_map = {}
 
-        if page_index == 0:
-            url = f"https://apibay.org/q.php?q=user:{APIBAY_USER}"
-        else:
-            url = f"https://apibay.org/q.php?q=user:{APIBAY_USER}:{page_index}"
+    def worker(proxy_url):
+        """Fetch pages from queue until empty."""
+        nonlocal pages_done, pages_failed, new_total, upd_total
 
-        print(f"[apibay] Page {page_index + 1}: {url}")
+        proxy_dict = {"http": proxy_url, "https": proxy_url}
+        worker_pages_done = 0
+        worker_pages_failed = 0
 
-        prev_idx = proxy_idx
-        data, proxy_idx = fetch_json(url, proxies, proxy_idx, timeout=timeout)
-        if proxy_idx != prev_idx:
-            print(f"  [crawl] Proxy switched: {prev_idx} → {proxy_idx}")
-
-        if data is None:
-            consecutive_errors += 1
-            print(f"[apibay] Page {page_index + 1} failed. Consecutive errors: {consecutive_errors}/{max_consecutive_errors}")
-            if consecutive_errors >= max_consecutive_errors:
-                print("[apibay] Max consecutive errors reached — aborting.")
+        while not should_stop.is_set():
+            try:
+                page_idx = page_queue.get(timeout=1)
+            except queue.Empty:
                 break
-            page_index += 1
-            pages_fetched += 1
-            time.sleep(sleep_between * 3)
-            continue
 
-        consecutive_errors = 0
-
-        page_entries = parse_apibay_page(data)
-        if not page_entries:
-            print("[apibay] Empty page — stopping.")
-            break
-
-        new_count = 0
-        upd_count = 0
-        skipped_no_seed = 0
-
-        for e in page_entries:
-            ih = normalize_infohash(e.get("infohash_raw") or "")
-            if not ih:
-                continue
-
-            seeds = e.get("seeds", 0)
-            seen_this_run[ih] = seeds
-
-            if seeds <= 0:
-                skipped_no_seed += 1
-                continue
-
-            title = sanitize_title(e.get("name") or "")
-            if not title:
-                continue
-
-            uri = build_magnet(ih, title)
-            uploaded = normalize_upload_date(e.get("uploaded_raw"))
-            file_size = bytes_to_human(e.get("size"))
-
-            entry = {"title": title, "uris": [uri]}
-            if uploaded:
-                entry["uploadDate"] = uploaded
-            if file_size:
-                entry["fileSize"] = file_size
-
-            if ih in accumulated:
-                upd_count += 1
+            if page_idx == 0:
+                url = f"https://apibay.org/q.php?q=user:{APIBAY_USER}"
             else:
-                new_count += 1
-            accumulated[ih] = entry
+                url = f"https://apibay.org/q.php?q=user:{APIBAY_USER}:{page_idx}"
 
-        print(f"  +{new_count} new, ~{upd_count} updated, -{skipped_no_seed} no-seed, total: {len(accumulated)}")
+            try:
+                r = requests.get(url, proxies=proxy_dict, timeout=timeout)
+            except requests.RequestException as exc:
+                worker_pages_failed += 1
+                # Re-queue for another proxy to try (infinite retry across all proxies)
+                page_queue.put(page_idx)
+                page_queue.task_done()
+                continue
 
-        # Incremental save
-        downloads = sort_downloads(list(accumulated.values()))
-        write_json(output_path, downloads)
+            if r.status_code != 200:
+                worker_pages_failed += 1
+                page_queue.put(page_idx)
+                page_queue.task_done()
+                continue
 
-        page_index += 1
-        pages_fetched += 1
-        time.sleep(sleep_between)
+            try:
+                page_data = r.json()
+            except Exception:
+                worker_pages_failed += 1
+                page_queue.put(page_idx)
+                page_queue.task_done()
+                continue
+
+            page_entries = parse_apibay_page(page_data)
+
+            if page_entries:
+                w_new = 0
+                w_upd = 0
+                w_skip = 0
+
+                for e in page_entries:
+                    ih = normalize_infohash(e.get("infohash_raw") or "")
+                    if not ih:
+                        continue
+                    seeds = e.get("seeds", 0)
+
+                    title = sanitize_title(e.get("name") or "")
+                    if not title:
+                        continue
+
+                    uri = build_magnet(ih, title)
+                    uploaded = normalize_upload_date(e.get("uploaded_raw"))
+                    file_size = bytes_to_human(e.get("size"))
+
+                    entry = {"title": title, "uris": [uri]}
+                    if uploaded:
+                        entry["uploadDate"] = uploaded
+                    if file_size:
+                        entry["fileSize"] = file_size
+
+                    with lock:
+                        seen_this_run[ih] = seeds
+                        if ih in accumulated:
+                            w_upd += 1
+                        else:
+                            w_new += 1
+                        accumulated[ih] = entry
+
+                with lock:
+                    new_total += w_new
+                    upd_total += w_upd
+                    pages_done += 1
+
+            worker_pages_done += 1
+            page_queue.task_done()
+
+        # Worker finished — report
+        with lock:
+            pages_failed += worker_pages_failed
+
+    # ── launch workers ──────────────────────────────────────────────────
+    n_workers = min(n_proxies, total_pages)
+    print(f"[crawl] Launching {n_workers} workers for {total_pages} pages...")
+
+    with ThreadPoolExecutor(max_workers=n_workers) as executor:
+        futures = []
+        for i in range(n_workers):
+            proxy = proxies[i % n_proxies]
+            f = executor.submit(worker, proxy)
+            futures.append(f)
+
+        # Monitor loop — periodic saves and progress reporting
+        start_time = time.monotonic()
+        last_save = 0
+        while any(not f.done() for f in futures):
+            time.sleep(2)
+            elapsed = time.monotonic() - start_time
+            with lock:
+                d = pages_done
+                remaining = page_queue.qsize()
+            pct = (d / total_pages * 100) if total_pages else 0
+            rate = (d / elapsed) if elapsed > 0 else 0
+            eta = ((total_pages - d) / rate) if rate > 0 else 0
+            print(f"  [{d}/{total_pages}] {pct:.0f}% | {rate:.1f} pg/s | ETA {eta:.0f}s | queue: {remaining}")
+
+            # Periodic save
+            if d > 0 and d - last_save >= save_interval:
+                with lock:
+                    downloads = sort_downloads(list(accumulated.values()))
+                write_json(output_path, downloads)
+                last_save = d
+                print(f"  [save] {len(downloads)} entries written.")
+
+        # Drain remaining futures
+        for f in futures:
+            f.result()
+
+    # ── final stats ─────────────────────────────────────────────────────
+    elapsed = time.monotonic() - start_time
+    print(f"\n[crawl] Finished in {elapsed:.1f}s — {pages_done} pages, {pages_failed} failed retries")
+    print(f"  +{new_total} new, ~{upd_total} updated, total: {len(accumulated)}")
 
     # ── post-crawl: pruning ─────────────────────────────────────────────
     pruned_count = 0
@@ -440,7 +492,7 @@ def main():
     default_proxy = os.path.join(script_dir, "proxy_list")
 
     parser = argparse.ArgumentParser(
-        description="Crawl dauphong torrents and generate a Hydra-Launcher-compatible JSON source.",
+        description="Crawl dauphong torrents in parallel and generate a Hydra-Launcher-compatible JSON source.",
     )
     parser.add_argument("--output", "-o", default="sources/dauphong.json",
                         help="Output JSON file path (default: sources/dauphong.json)")
@@ -448,16 +500,14 @@ def main():
                         help=f"Path to proxy list file (default: {default_proxy})")
     parser.add_argument("--max-pages", type=int, default=None,
                         help="Max pages to fetch (default: unlimited)")
-    parser.add_argument("--sleep", type=float, default=1.0,
-                        help="Delay in seconds between page requests (default: 1.0)")
     parser.add_argument("--max-versions", type=int, default=3,
                         help="Keep only N most recent uploads per game. 0 = disable (default: 3)")
-    parser.add_argument("--max-consecutive-errors", type=int, default=10,
-                        help="Abort after N consecutive page failures (default: 10)")
     parser.add_argument("--timeout", type=int, default=30,
                         help="HTTP request timeout in seconds (default: 30)")
     parser.add_argument("--no-prune", action="store_true",
                         help="Skip removal of entries seen with 0 seeds this run")
+    parser.add_argument("--save-interval", type=int, default=10,
+                        help="Save results every N completed pages (default: 10)")
 
     args = parser.parse_args()
 
@@ -465,11 +515,10 @@ def main():
         output_path=args.output,
         proxy_file=args.proxy_file,
         max_pages=args.max_pages,
-        sleep_between=args.sleep,
         max_versions=args.max_versions,
-        max_consecutive_errors=args.max_consecutive_errors,
         timeout=args.timeout,
         no_prune=args.no_prune,
+        save_interval=args.save_interval,
     )
 
 

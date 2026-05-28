@@ -1,4 +1,1 @@
 requests
-# curl_cffi is recommended for best Cloudflare bypass (browser TLS fingerprint)
-# Install separately: pip install curl_cffi
-curl_cffi
